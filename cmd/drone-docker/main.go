@@ -7,7 +7,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 
-	"github.com/drone-plugins/drone-docker"
+	docker "github.com/drone-plugins/drone-docker"
 )
 
 var (
@@ -50,7 +50,7 @@ func main() {
 		cli.StringFlag{
 			Name:   "daemon.mirror",
 			Usage:  "docker daemon registry mirror",
-			EnvVar: "PLUGIN_MIRROR",
+			EnvVar: "PLUGIN_MIRROR,DOCKER_PLUGIN_MIRROR",
 		},
 		cli.StringFlag{
 			Name:   "daemon.storage-driver",
@@ -147,6 +147,11 @@ func main() {
 			Usage:  "build args",
 			EnvVar: "PLUGIN_BUILD_ARGS_FROM_ENV",
 		},
+		cli.BoolFlag{
+			Name:   "quiet",
+			Usage:  "quiet docker build",
+			EnvVar: "PLUGIN_QUIET",
+		},
 		cli.StringFlag{
 			Name:   "target",
 			Usage:  "build target",
@@ -187,6 +192,16 @@ func main() {
 			Usage:  "label-schema labels",
 			EnvVar: "PLUGIN_LABEL_SCHEMA",
 		},
+		cli.BoolTFlag{
+			Name:   "auto-label",
+			Usage:  "auto-label true|false",
+			EnvVar: "PLUGIN_AUTO_LABEL",
+		},
+		cli.StringFlag{
+			Name:   "link",
+			Usage:  "link https://example.com/org/repo-name",
+			EnvVar: "PLUGIN_REPO_LINK,DRONE_REPO_LINK",
+		},
 		cli.StringFlag{
 			Name:   "docker.registry",
 			Usage:  "docker registry",
@@ -208,6 +223,11 @@ func main() {
 			Usage:  "docker email",
 			EnvVar: "PLUGIN_EMAIL,DOCKER_EMAIL",
 		},
+		cli.StringFlag{
+			Name:   "docker.config",
+			Usage:  "docker json dockerconfig content",
+			EnvVar: "PLUGIN_CONFIG,DOCKER_PLUGIN_CONFIG",
+		},
 		cli.BoolTFlag{
 			Name:   "docker.purge",
 			Usage:  "docker should cleanup images",
@@ -222,6 +242,11 @@ func main() {
 			Name:   "no-cache",
 			Usage:  "do not use cached intermediate containers",
 			EnvVar: "PLUGIN_NO_CACHE",
+		},
+		cli.StringSliceFlag{
+			Name:   "add-host",
+			Usage:  "additional host:IP mapping",
+			EnvVar: "PLUGIN_ADD_HOST",
 		},
 	}
 
@@ -239,24 +264,29 @@ func run(c *cli.Context) error {
 			Username: c.String("docker.username"),
 			Password: c.String("docker.password"),
 			Email:    c.String("docker.email"),
+			Config:   c.String("docker.config"),
 		},
 		Build: docker.Build{
-			Remote:      c.String("remote.url"),
-			Name:        c.String("commit.sha"),
-			Dockerfile:  c.String("dockerfile"),
-			Context:     c.String("context"),
-			Tags:        c.StringSlice("tags"),
-			Args:        c.StringSlice("args"),
-			ArgsEnv:     c.StringSlice("args-from-env"),
-			Target:      c.String("target"),
-			Squash:      c.Bool("squash"),
-			Pull:        c.BoolT("pull-image"),
-			CacheFrom:   c.StringSlice("cache-from"),
-			Compress:    c.Bool("compress"),
-			Repo:        c.String("repo"),
-			Labels:      c.StringSlice("custom-labels"),
-			LabelSchema: c.StringSlice("label-schema"),
-			NoCache:     c.Bool("no-cache"),
+			Remote:        c.String("remote.url"),
+			Name:          c.String("commit.sha"),
+			Dockerfile:    c.String("dockerfile"),
+			Context:       c.String("context"),
+			Tags:          c.StringSlice("tags"),
+			Args:          c.StringSlice("args"),
+			ArgsEnv:       c.StringSlice("args-from-env"),
+			Target:        c.String("target"),
+			Squash:        c.Bool("squash"),
+			Pull:          c.BoolT("pull-image"),
+			CacheFrom:     c.StringSlice("cache-from"),
+			Compress:      c.Bool("compress"),
+			Repo:          c.String("repo"),
+			Labels:        c.StringSlice("custom-labels"),
+			LabelSchema:   c.StringSlice("label-schema"),
+			AutoLabel:     c.BoolT("auto-label"),
+			Link:          c.String("link"),
+			NoCache:       c.Bool("no-cache"),
+			AddHost:       c.StringSlice("add-host"),
+			Quiet:         c.Bool("quiet"),
 		},
 		Daemon: docker.Daemon{
 			Registry:      c.String("docker.registry"),
@@ -280,10 +310,15 @@ func run(c *cli.Context) error {
 			c.String("commit.ref"),
 			c.String("repo.branch"),
 		) {
-			plugin.Build.Tags = docker.DefaultTagSuffix(
+			tag, err := docker.DefaultTagSuffix(
 				c.String("commit.ref"),
 				c.String("tags.suffix"),
 			)
+			if err != nil {
+				logrus.Printf("cannot build docker image for %s, invalid semantic version", c.String("commit.ref"))
+				return err
+			}
+			plugin.Build.Tags = tag
 		} else {
 			logrus.Printf("skipping automated docker build for %s", c.String("commit.ref"))
 			return nil

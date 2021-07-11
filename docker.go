@@ -2,8 +2,10 @@ package docker
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -32,26 +34,31 @@ type (
 		Username string // Docker registry username
 		Password string // Docker registry password
 		Email    string // Docker registry email
+		Config   string // Docker Auth Config
 	}
 
 	// Build defines Docker build parameters.
 	Build struct {
-		Remote      string   // Git remote URL
-		Name        string   // Docker build using default named tag
-		Dockerfile  string   // Docker build Dockerfile
-		Context     string   // Docker build context
-		Tags        []string // Docker build tags
-		Args        []string // Docker build args
-		ArgsEnv     []string // Docker build args from env
-		Target      string   // Docker build target
-		Squash      bool     // Docker build squash
-		Pull        bool     // Docker build pull
-		CacheFrom   []string // Docker build cache-from
-		Compress    bool     // Docker build compress
-		Repo        string   // Docker build repository
-		LabelSchema []string // label-schema Label map
-		Labels      []string // Label map
-		NoCache     bool     // Docker build no-cache
+		Remote        string   // Git remote URL
+		Name          string   // Docker build using default named tag
+		Dockerfile    string   // Docker build Dockerfile
+		Context       string   // Docker build context
+		Tags          []string // Docker build tags
+		Args          []string // Docker build args
+		ArgsEnv       []string // Docker build args from env
+		Target        string   // Docker build target
+		Squash        bool     // Docker build squash
+		Pull          bool     // Docker build pull
+		CacheFrom     []string // Docker build cache-from
+		Compress      bool     // Docker build compress
+		Repo          string   // Docker build repository
+		LabelSchema   []string // label-schema Label map
+		AutoLabel     bool     // auto-label bool
+		Labels        []string // Label map
+		Link          string   // Git repo link
+		NoCache       bool     // Docker build no-cache
+		AddHost       []string // Docker build add-host
+		Quiet         bool     // Docker build quiet
 	}
 
 	// Plugin defines the Docker plugin parameters.
@@ -82,6 +89,17 @@ func (p Plugin) Exec() error {
 		time.Sleep(time.Second * 1)
 	}
 
+	// Create Auth Config File
+	if p.Login.Config != "" {
+		os.MkdirAll(dockerHome, 0600)
+
+		path := filepath.Join(dockerHome, "config.json")
+		err := ioutil.WriteFile(path, []byte(p.Login.Config), 0600)
+		if err != nil {
+			return fmt.Errorf("Error writing config.json: %s", err)
+		}
+	}
+
 	// login to the Docker registry
 	if p.Login.Password != "" {
 		cmd := commandLogin(p.Login)
@@ -89,8 +107,15 @@ func (p Plugin) Exec() error {
 		if err != nil {
 			return fmt.Errorf("Error authenticating: %s", err)
 		}
-	} else {
-		fmt.Println("Registry credentials not provided. Guest mode enabled.")
+	}
+
+	switch {
+	case p.Login.Password != "":
+		fmt.Println("Detected registry credentials")
+	case p.Login.Config != "":
+		fmt.Println("Detected registry credentials file")
+	default:
+		fmt.Println("Registry credentials or Docker config not provided. Guest mode enabled.")
 	}
 
 	if p.Build.Squash && !p.Daemon.Experimental {
@@ -134,6 +159,10 @@ func (p Plugin) Exec() error {
 		err := cmd.Run()
 		if err != nil && isCommandPull(cmd.Args) {
 			fmt.Printf("Could not pull cache-from image %s. Ignoring...\n", cmd.Args[2])
+		} else if err != nil && isCommandPrune(cmd.Args) {
+			fmt.Printf("Could not prune system containers. Ignoring...\n")
+		} else if err != nil && isCommandRmi(cmd.Args) {
+			fmt.Printf("Could not remove image %s. Ignoring...\n", cmd.Args[2])
 		} else if err != nil {
 			return err
 		}
@@ -215,23 +244,32 @@ func commandBuild(build Build) *exec.Cmd {
 	for _, arg := range build.Args {
 		args = append(args, "--build-arg", arg)
 	}
+	for _, host := range build.AddHost {
+		args = append(args, "--add-host", host)
+	}
 	if build.Target != "" {
 		args = append(args, "--target", build.Target)
 	}
-
-	labelSchema := []string{
-		"schema-version=1.0",
-		fmt.Sprintf("build-date=%s", time.Now().Format(time.RFC3339)),
-		fmt.Sprintf("vcs-ref=%s", build.Name),
-		fmt.Sprintf("vcs-url=%s", build.Remote),
+	if build.Quiet {
+		args = append(args, "--quiet")
 	}
 
-	if len(build.LabelSchema) > 0 {
-		labelSchema = append(labelSchema, build.LabelSchema...)
-	}
+	if build.AutoLabel {
+		labelSchema := []string{
+			fmt.Sprintf("created=%s", time.Now().Format(time.RFC3339)),
+			fmt.Sprintf("revision=%s", build.Name),
+			fmt.Sprintf("source=%s", build.Remote),
+			fmt.Sprintf("url=%s", build.Link),
+		}
+		labelPrefix := "org.opencontainers.image"
 
-	for _, label := range labelSchema {
-		args = append(args, "--label", fmt.Sprintf("org.label-schema.%s", label))
+		if len(build.LabelSchema) > 0 {
+			labelSchema = append(labelSchema, build.LabelSchema...)
+		}
+
+		for _, label := range labelSchema {
+			args = append(args, "--label", fmt.Sprintf("%s.%s", labelPrefix, label))
+		}
 	}
 
 	if len(build.Labels) > 0 {
@@ -305,7 +343,14 @@ func commandPush(build Build, tag string) *exec.Cmd {
 
 // helper function to create the docker daemon command.
 func commandDaemon(daemon Daemon) *exec.Cmd {
-	args := []string{"--data-root", daemon.StoragePath}
+	args := []string{
+		"--data-root", daemon.StoragePath,
+		"--host=unix:///var/run/docker.sock",
+	}
+
+	if _, err := os.Stat("/etc/docker/default.json"); err == nil {
+		args = append(args, "--seccomp-profile=/etc/docker/default.json")
+	}
 
 	if daemon.StorageDriver != "" {
 		args = append(args, "-s", daemon.StorageDriver)
@@ -337,8 +382,18 @@ func commandDaemon(daemon Daemon) *exec.Cmd {
 	return exec.Command(dockerdExe, args...)
 }
 
+// helper to check if args match "docker prune"
+func isCommandPrune(args []string) bool {
+	return len(args) > 3 && args[2] == "prune"
+}
+
 func commandPrune() *exec.Cmd {
 	return exec.Command(dockerExe, "system", "prune", "-f")
+}
+
+// helper to check if args match "docker rmi"
+func isCommandRmi(args []string) bool {
+	return len(args) > 2 && args[1] == "rmi"
 }
 
 func commandRmi(tag string) *exec.Cmd {

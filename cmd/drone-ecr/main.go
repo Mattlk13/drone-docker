@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/joho/godotenv"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
@@ -20,6 +22,11 @@ import (
 const defaultRegion = "us-east-1"
 
 func main() {
+	// Load env-file if it exists first
+	if env := os.Getenv("PLUGIN_ENV_FILE"); env != "" {
+		godotenv.Load(env)
+	}
+
 	var (
 		repo             = getenv("PLUGIN_REPO")
 		registry         = getenv("PLUGIN_REGISTRY")
@@ -30,6 +37,7 @@ func main() {
 		lifecyclePolicy  = getenv("PLUGIN_LIFECYCLE_POLICY")
 		repositoryPolicy = getenv("PLUGIN_REPOSITORY_POLICY")
 		assumeRole       = getenv("PLUGIN_ASSUME_ROLE")
+		scanOnPush       = parseBoolOrDefault(false, getenv("PLUGIN_SCAN_ON_PUSH"))
 	)
 
 	// set the region
@@ -65,9 +73,13 @@ func main() {
 	}
 
 	if create {
-		err = ensureRepoExists(svc, trimHostname(repo, registry))
+		err = ensureRepoExists(svc, trimHostname(repo, registry), scanOnPush)
 		if err != nil {
 			log.Fatal(fmt.Sprintf("error creating ECR repo: %v", err))
+		}
+		err = updateImageScannningConfig(svc, trimHostname(repo, registry), scanOnPush)
+		if err != nil {
+			log.Fatal(fmt.Sprintf("error updating scan on push for ECR repo: %v", err))
 		}
 	}
 
@@ -111,9 +123,10 @@ func trimHostname(repo, registry string) string {
 	return repo
 }
 
-func ensureRepoExists(svc *ecr.ECR, name string) (err error) {
+func ensureRepoExists(svc *ecr.ECR, name string, scanOnPush bool) (err error) {
 	input := &ecr.CreateRepositoryInput{}
 	input.SetRepositoryName(name)
+	input.SetImageScanningConfiguration(&ecr.ImageScanningConfiguration{ScanOnPush: &scanOnPush})
 	_, err = svc.CreateRepository(input)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == ecr.ErrCodeRepositoryAlreadyExistsException {
@@ -123,6 +136,15 @@ func ensureRepoExists(svc *ecr.ECR, name string) (err error) {
 	}
 
 	return
+}
+
+func updateImageScannningConfig(svc *ecr.ECR, name string, scanOnPush bool) (err error) {
+	input := &ecr.PutImageScanningConfigurationInput{}
+	input.SetRepositoryName(name)
+	input.SetImageScanningConfiguration(&ecr.ImageScanningConfiguration{ScanOnPush: &scanOnPush})
+	_, err = svc.PutImageScanningConfiguration(input)
+
+	return err
 }
 
 func uploadLifeCyclePolicy(svc *ecr.ECR, lifecyclePolicy string, name string) (err error) {
